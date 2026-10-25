@@ -1,0 +1,30 @@
+# ---- 运行时产物（不该进仓库）----
+screenshots/
+instance_timestamps.json
+zhihu_cookies.json
+zhihu_qr.png
+zhihu_qr_login.png
+*.log
+run.log
+
+# ---- 真实配置（含账号密码/钉钉 token，只提交 config.example.yaml）----
+config.yaml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 临时文件 / 备份 ----
+*.bak
+*.orig
+*.zip
+*.tar.gz
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

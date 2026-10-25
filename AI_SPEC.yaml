@@ -1,0 +1,1209 @@
+# =============================================================================
+# AI_SPEC.yaml — MACHINE-ONLY PROJECT SPECIFICATION. HUMAN NOT REQUIRED TO READ.
+# =============================================================================
+# INSTRUCTION FOR LLM (READ FIRST, PARSE STRICTLY):
+# 1. Parse ALL fields. Do NOT ignore tags: reusable, coupling, hard_constraint,
+#    side_effect, anti_pattern, extract_note, porting_note.
+# 2. Classify every function/module:
+#      reusable: yes      → copy-paste directly to other projects
+#      reusable: partial  → minor adaptation needed before reuse
+#      reusable: no       → tightly coupled to THIS project business, cannot extract
+# 3. For reusable=yes/partial: output extraction suggestion + required deps +
+#    modification points.
+# 4. Enforce ALL hard_constraint items. Any code generation must NOT violate them.
+# 5. Analyze technical_debt + risk_items for bug-hunting and refactoring.
+# 6. State-machine (form_status) must be followed EXACTLY when modifying logic.
+# 7. When refactoring/porting: separate generic infra code from sanfengyun-specific
+#    business code.
+# 8. Output diff-style incremental changes. Avoid full-file rewrite unless asked.
+# 9. DOM page data has HIGHER priority than local json. json is ONLY for scheduling
+#    countdown, never as source of truth for business state.
+# =============================================================================
+
+meta:
+  project_name: sanfeng_renewcat
+  main_file: renewcat.py
+  language: python3
+  entry_modes:
+    - "--test"    : full flow (scan → publish article → fill form, NO submit)
+    - "--once"    : single full run with real submit
+    - "<no flag>" : daemon loop mode
+  major_deps:
+    - playwright (sync api ONLY, NO async-playwright)
+    - playwright-stealth
+    - pyyaml
+    - requests
+    - Pillow (optional, for screenshot compression)
+    - json, time, datetime, re, logging, os, pathlib (stdlib)
+  runtime_model: single_process_single_loop
+  sleep_strategy: slice_sleep, SLEEP_SLICE=60s
+  signal_support: KeyboardInterrupt → graceful exit (close browser, save state)
+  persistence_medium: local json file "instance_timestamps.json"
+  external_services:
+    - sanfengyun.com (cloud control panel, Vue SPA)
+    - zhihu.com (article publishing platform)
+    - dingtalk webhook robot (notification)
+
+deployment:
+  entrypoint: install.sh          # one-click installer for Linux, root required
+  supported_os:
+    - "ubuntu / debian  -> apt"
+    - "centos / rhel / almalinux / rocky / fedora / openeuler -> dnf"
+  installs_system: [python3, python3-venv, xvfb, CJK fonts, chromium runtime libs]
+  python_env: "<install_dir>/.venv"
+  pip_index_default: "https://pypi.tuna.tsinghua.edu.cn/simple"   # fallback -> official PyPI
+  playwright_download_host: "https://cdn.npmmirror.com/binaries/playwright"
+  service_unit: "systemd renewcat.service (Type=simple, KillSignal=SIGINT, Restart=on-failure)"
+  config_bootstrap: "config.example.yaml -> config.yaml; NEVER overwrite an existing config.yaml"
+  placeholder_gate: "service is only started when config has no placeholder values"
+  idempotent: true               # re-running = copy code over + reinstall deps if missing + restart
+  flags: [--dir, --src, --repo, --config, --update, --yes, --login, --no-service, --skip-deps, --pip-index]
+  verification: ["bash -n", "py_compile *.py", "import renewcat", "config placeholder scan"]
+  measured: "Ubuntu 22.04, cached chromium: full run in ~29s"
+
+persistence_schema:
+  file: instance_timestamps.json
+  root_type: object
+  key_pattern: "$instance_key: str, format: freeServer_<id> / freeVhost_<id>"
+  item_schema:
+    next_allow_submit_ts: int  # unix timestamp; next permitted trigger time
+  note: >
+    json is ONLY a scheduling cache. On every trigger the script re-reads DOM
+    to get true state. If json and DOM disagree, DOM wins.
+  corruption_handling:
+    read: FileNotFoundError / JSONDecodeError → return {} (full re-scan on startup)
+    write: any exception → logger.error, do NOT crash
+
+global_constants:
+  BASE_DIR: Path(__file__).resolve().parent
+  SCREENSHOT_DIR: BASE_DIR / "screenshots"     # auto mkdir(exist_ok=True) at import
+  STATE_FILE: BASE_DIR / "instance_timestamps.json"
+  SLEEP_SLICE: 60          # slice sleep seconds; MUST stay 60 for responsive Ctrl+C
+  TRIGGER_DELAY: 60        # buffer after next_ts before trigger (server clock skew)
+  URGENT_HINT_THRESHOLD: 1800  # push "urgent" notify when remain <= 30min
+  cooldown_seconds:
+    submit_success: 14400     # 4h — wait for platform audit
+    in_review: 7200           # 2h — wait for audit result, re-scan until form_status changes
+    not_activated: 86400      # 24h — re-check unactivated product
+    submit_fail: 1800         # 30min — retry after failure
+    not_yet_fallback: 1800    # 30min — when DOM has no renew_time text
+  hard_constant_locked:
+    - SLEEP_SLICE must stay 60 (responsive exit)
+    - must use playwright sync api, do NOT switch to async
+    - single file upload only, never pass list to set_input_files
+    - must use headless=False + Xvfb (Aliyun captcha detects headless=True)
+    - must call _ensure_display() before launch_browser with headless=False
+
+# =============================================================================
+# FUNCTION CATALOG
+# reusable: yes | partial | no
+# coupling: none | framework | external | business_sanfengyun | business_zhihu | business_dingtalk | full_business
+# side_effect: list of external effects
+# =============================================================================
+
+function_catalog:
+
+  # ---------------- renewcat.py (entry & orchestration) ----------------
+
+  setup_logging:
+    signature: "def setup_logging(cfg: dict) -> None"
+    module: renewcat.py
+    reusable: yes
+    coupling: none
+    side_effect: [logging config, optional file handler creation]
+    input: "cfg dict with keys: level(default INFO), file(optional path)"
+    output: None
+    description: configure root logger with stdout + optional file handler
+    extract_note: generic logging setup, copy to any python project directly
+
+  load_instance_state:
+    signature: "def load_instance_state() -> dict"
+    module: renewcat.py
+    reusable: yes
+    coupling: none
+    side_effect: [file read]
+    input: none
+    output: dict; empty dict {} if file missing/corrupt
+    description: load json persistence file with exception handling
+    extract_note: generic json state loader; change STATE_FILE const to reuse
+
+  save_instance_state:
+    signature: "def save_instance_state(state: dict) -> None"
+    module: renewcat.py
+    reusable: yes
+    coupling: none
+    side_effect: [overwrite disk file]
+    input: state dict
+    output: None
+    description: persist runtime state to json; swallow write exceptions
+    extract_note: generic json persistence utility; NOT atomic (no tmp+rename)
+
+  _instance_key:
+    signature: "def _instance_key(product: dict) -> str"
+    module: renewcat.py
+    reusable: partial
+    coupling: business_sanfengyun
+    side_effect: []
+    input: product dict with "url" field
+    output: str like "freeServer_532542"
+    description: regex extract (freeServer|freeVhost)/(\d+) from product url
+    extract_note: the "regex key from url" pattern is reusable; regex itself is sanfengyun-specific
+
+  load_config:
+    signature: "def load_config() -> dict"
+    module: renewcat.py
+    reusable: yes
+    coupling: none
+    side_effect: [file read]
+    input: none (reads BASE_DIR/config.yaml)
+    output: dict
+    description: load yaml config from BASE_DIR/config.yaml
+    extract_note: generic yaml config loader
+
+  find_chromium:
+    signature: "def find_chromium() -> str"
+    module: renewcat.py
+    reusable: partial
+    coupling: framework
+    side_effect: []
+    input: none
+    output: chromium executable path or ""
+    description: search common chromium paths; fallback to "" (playwright default)
+    extract_note: path list is linux-specific; adapt binary paths for other OS
+
+  launch_browser:
+    signature: "def launch_browser(pw, headless=True)"
+    module: renewcat.py
+    reusable: partial
+    coupling: framework
+    side_effect: [launch chromium process]
+    input: playwright instance, headless bool
+    output: browser context
+    description: launch chromium with find_chromium path
+    extract_note: generic playwright launch wrapper
+
+  new_page:
+    signature: "def new_page(context)"
+    module: renewcat.py
+    reusable: yes
+    coupling: framework
+    side_effect: [create browser page, inject stealth]
+    input: playwright context
+    output: page
+    description: create page + apply playwright-stealth to hide automation
+    extract_note: generic stealth page creation; reusable in any playwright project
+
+  run_test:
+    signature: "def run_test(cfg: dict, notifier)"
+    module: renewcat.py
+    reusable: no
+    coupling: full_business
+    side_effect: [browser, network, file write, screenshot]
+    description: "--test mode: full flow but fill_and_submit(dry_run=True), NO real submit"
+    extract_note: business flow; not extractable
+
+  run_once:
+    signature: "def run_once(cfg: dict, notifier)"
+    module: renewcat.py
+    reusable: no
+    coupling: full_business
+    side_effect: [browser, network, file write, screenshot, real form submit]
+    description: "--once mode: single full run with real submit"
+    extract_note: business flow; not extractable
+
+  run_loop:
+    signature: "def run_loop(cfg: dict, notifier)"
+    module: renewcat.py
+    reusable: partial
+    coupling: full_business
+    side_effect: [infinite loop, browser, file r/w, network]
+    description: "daemon mode: slice-sleep loop, per-instance countdown, trigger on time"
+    extract_note: >
+      the "single-thread slice-sleep state-machine loop skeleton" is reusable;
+      inner business branches (scan/publish/submit) must be rewritten for other projects.
+      See reusable_template_extract_map.
+
+  _next_ts_from_status:
+    signature: "def _next_ts_from_status(status: dict) -> int"
+    module: renewcat.py (nested in run_loop)
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: []
+    input: scan status dict with form_status/can_renew/renew_time
+    output: unix timestamp int
+    description: map DOM form_status → next trigger timestamp per cooldown rules
+    extract_note: cooldown mapping logic is reusable pattern; values are project-specific
+
+  _execute_single_product:
+    signature: "def _execute_single_product(ctx, product, notifier_obj) -> str"
+    module: renewcat.py (nested in run_loop)
+    reusable: no
+    coupling: full_business
+    side_effect: [browser, network, file write, screenshot, dingtalk notify]
+    input: ctx (browser+scanner+publisher+renewer+gen+settings), product dict, notifier
+    output: '"ok" | "skip" | "fail"'
+    description: >
+      CORE workflow: Phase A DOM scan form_status → Phase B branch:
+      ready → publish article → submit form → cooldown 4h
+      in_review → skip → cooldown 2h (re-scan loop until form_status changes)
+      not_activated → skip → cooldown 24h
+      not_yet → skip → cooldown from renew_time or 30min fallback
+    hard_constraint:
+      - NEVER publish article before DOM confirms form_status == ready
+      - in_review must NOT publish article (prevents duplicate posts)
+    extract_note: tightly coupled to all 3 external services; cannot extract
+
+  _calc_wait_seconds:
+    signature: "def _calc_wait_seconds(status: dict) -> int"
+    module: renewcat.py
+    reusable: partial
+    coupling: none
+    side_effect: []
+    input: status dict with per-instance next_allow_submit_ts
+    output: seconds until earliest trigger
+    description: compute min wait time across all instances
+    extract_note: generic min-wait computation
+
+  _human_countdown:
+    signature: "def _human_countdown(seconds: int) -> str"
+    module: renewcat.py
+    reusable: yes
+    coupling: none
+    side_effect: []
+    input: int seconds
+    output: human readable string "Xd Xh Xm"
+    description: convert seconds to human countdown string
+    extract_note: generic formatter, fully portable
+
+  _wait_until:
+    signature: "def _wait_until(renew_time_str: str)"
+    module: renewcat.py
+    reusable: partial
+    coupling: none
+    side_effect: [blocking sleep]
+    input: 'datetime string "YYYY-MM-DD HH:MM:SS"'
+    output: None
+    description: sleep until target time using slice sleep for interruptibility
+    extract_note: generic sleep-until pattern; reusable
+
+  _notify_scan_result:
+    signature: "def _notify_scan_result(notifier, results: list)"
+    module: renewcat.py
+    reusable: no
+    coupling: business_dingtalk
+    side_effect: [http post to dingtalk]
+    input: notifier, scan results list
+    output: None
+    description: format and send scan summary to dingtalk
+    extract_note: dingtalk-specific; skeleton pattern reusable
+
+  main:
+    signature: "def main()"
+    module: renewcat.py
+    reusable: no
+    coupling: full_business
+    side_effect: [everything]
+    description: CLI entry; parse args, load config, init notifier, dispatch to run_test/run_once/run_loop
+    extract_note: not extractable
+
+  # ---------------- scanner.py (SanfengyunScanner) ----------------
+
+  SanfengyunScanner.ensure_login:
+    signature: "def ensure_login(self, page) -> bool"
+    module: scanner.py
+    reusable: partial
+    coupling: business_sanfengyun
+    side_effect: [network, cookie modification]
+    input: playwright page
+    output: bool
+    description: >
+      FORCE re-login every time (clear cookies → _do_login).
+      Reason: sanfengyun cookie has cross-subdomain issue, "skip if logged in" is unreliable.
+    extract_note: '"force relogin" pattern reusable; sanfengyun selectors not'
+
+  SanfengyunScanner._do_login:
+    signature: "def _do_login(self, page) -> bool"
+    module: scanner.py
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: [network, form fill]
+    description: fill #userName/#passwordInput, click #loginSubmit, fix cookie domain, verify
+    extract_note: sanfengyun selectors hard-coded
+
+  SanfengyunScanner._fix_cookie_domain:
+    signature: "def _fix_cookie_domain(self, page)"
+    module: scanner.py
+    reusable: partial
+    coupling: framework
+    side_effect: [cookie modification]
+    description: >
+      Change all sanfengyun cookie domain from www.sanfengyun.com to .sanfengyun.com
+      so api.sanfengyun.com can read login cookie. secure=False, sameSite=Lax.
+    extract_note: >
+      "cookie domain rewrite for cross-subdomain auth" pattern is reusable;
+      domain strings need adaptation.
+
+  SanfengyunScanner._verify_api_login:
+    signature: "def _verify_api_login(self, page) -> bool"
+    module: scanner.py
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: [network]
+    description: '3-tier verify: DOM body text no "未登录" -> fetch user_info api -> cookie has session_id'
+    extract_note: not portable
+
+  SanfengyunScanner.scan_product:
+    signature: "def scan_product(self, page, product: dict) -> dict"
+    module: scanner.py
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: [page navigation, screenshot]
+    input: page, product dict (name/ptype/url)
+    output: scan result dict (see data_schema)
+    description: >
+      DOM-based status extraction: goto product page, wait 5s for Vue render,
+      extract expire_time, detect not_activated (13 keywords), click renew tab,
+      detect form_status (ready/in_review/not_yet).
+    hard_constraint:
+      - extract expire_time BEFORE clicking renew tab (tab switch may hide header)
+      - not_activated detection must short-circuit before other checks
+    extract_note: tightly bound to sanfengyun DOM text patterns; not extractable
+
+  SanfengyunScanner.scan_all:
+    signature: "def scan_all(self, page, products: list) -> list"
+    module: scanner.py
+    reusable: partial
+    coupling: business_sanfengyun
+    side_effect: [multiple page navigation]
+    description: batch scan all enabled products
+    extract_note: '"batch scan + collect" pattern reusable; scan_product not'
+
+  SanfengyunScanner._extract_expire_time:
+    signature: "def _extract_expire_time(text: str, logger) -> str"
+    module: scanner.py
+    reusable: partial
+    coupling: none
+    side_effect: []
+    description: 'regex extract "到期时间: YYYY-MM-DD HH:MM:SS" with 2-level fallback'
+    extract_note: regex pattern reusable; date format assumption is project-specific
+
+  SanfengyunScanner._click_renew_tab:
+    signature: "def _click_renew_tab(self, page) -> bool"
+    module: scanner.py
+    reusable: partial
+    coupling: framework
+    side_effect: [page interaction]
+    description: >
+      Use page.evaluate to traverse .el-tabs__item/[role=tab]/button/span/div,
+      find element with text "免费延期"/"延期" and reasonable size, click it.
+      Robust against Element UI class changes.
+    extract_note: '"fuzzy tab click by text" pattern reusable in any SPA'
+
+  # ---------------- publisher.py (ZhihuPublisher) ----------------
+
+  ZhihuPublisher.login:
+    signature: "def login(self, page, on_qr=None) -> bool"
+    module: publisher.py
+    reusable: partial
+    coupling: business_zhihu
+    side_effect: [network, form fill, mouse interaction, file write, callback]
+    description: >
+      Login zhihu with a 3-step cascade:
+      (1) load zhihu_cookies.json -> re-check z_c0 cookie;
+      (2) password login: switch to 密码登录 tab, fill inputs, submit, poll <=45s,
+          calling _solve_slider when 滑块/验证 keywords appear;
+      (3) fallback: login_by_qr() — capture the QR and hand the file path to on_qr
+          (production wires it to DingTalk push), then poll for z_c0.
+      Cookies are saved to zhihu_cookies.json after any success.
+    extract_note: >
+      "cookie-first, password-second, pushed-QR-last" cascade is HIGHLY reusable
+      for any captcha-heavy login flow.
+    hard_constraint: login detection MUST check z_c0 cookie before DOM heuristics
+
+  ZhihuPublisher.login_by_qr:
+    signature: "def login_by_qr(self, page, on_qr=None, rounds=3, wait=150) -> bool"
+    module: publisher.py
+    reusable: partial
+    coupling: business_zhihu
+    side_effect: [network, screenshot, callback, file write]
+    description: >
+      Loop up to `rounds` times: open signin page -> click 扫码登录 -> screenshot the
+      QR element (upscaled to 552px via _upscale for phone scanning) -> call on_qr(path)
+      -> poll `wait` seconds for z_c0. Each round produces a fresh QR because zhihu
+      expires it in ~2 minutes. Saves cookies on success.
+    extract_note: >
+      "push a refreshing QR to an out-of-band channel (IM) and wait for the human"
+      is the reusable pattern for QR logins on headless servers.
+
+  ZhihuPublisher._open_qr:
+    signature: "def _open_qr(self, page) -> str"
+    module: publisher.py
+    reusable: partial
+    coupling: business_zhihu
+    side_effect: [network, screenshot file]
+    description: open signin, switch to QR tab, screenshot .SignFlow-qrcode / canvas / img[alt*=二维码], then upscale
+    extract_note: selector list is zhihu-specific; screenshot+upscale is generic
+
+  ZhihuPublisher._solve_slider:
+    signature: "def _solve_slider(self, page, max_retry: int = 3) -> bool"
+    module: publisher.py
+    reusable: partial
+    coupling: framework
+    side_effect: [mouse interaction]
+    description: >
+      Locate slider handle (yidun / geetest / aliyun / generic [class*='slider']),
+      read track width from the closest slider container rect, drag handle to the
+      right edge. Success detected by "验证成功" text. Retry up to 3 times.
+    extract_note: >
+      "human-like slider drag for captcha" pattern is HIGHLY reusable in any
+      web automation project facing slider captcha.
+
+  ZhihuPublisher._drag:
+    signature: "def _drag(page, box, distance: float) -> None"
+    module: publisher.py
+    reusable: yes
+    coupling: none
+    side_effect: [mouse interaction]
+    description: >
+      smoothstep easing t*t*(3-2t) over 22-38 steps with ±1.5px jitter;
+      mouse.down -> 120-220ms pause -> steps -> 150-350ms pause -> mouse.up.
+    extract_note: "generic human-like drag primitive; copy-paste directly"
+
+  ZhihuPublisher.publish:
+    signature: "def publish(self, page, title, content, sanitize_from, sanitize_to) -> tuple[bool,str,str]"
+    module: publisher.py
+    reusable: no
+    coupling: business_zhihu
+    side_effect: [create article, screenshot file, image compression]
+    input: page, title, content(markdown), sanitize_from, sanitize_to
+    output: (success, article_url, screenshot_path)
+    description: >
+      Sanitize words, truncate title to 100 chars, goto zhuanlan.zhihu.com/write,
+      fill title, convert markdown -> HTML and insert into the Draft.js editor,
+      click 发布 (and pick a column in the publish panel if it appears), wait for
+      /p/<id> in url or "发布成功" toast, goto public article page,
+      full_page screenshot, compress to 500KB.
+    hard_constraint:
+      - screenshot MUST be public article page (not admin edit page)
+      - screenshot MUST be full_page=True
+      - body MUST be inserted as rich text; Draft.js does NOT render raw markdown
+    extract_note: zhihu selectors not portable; "publish + screenshot" pattern reusable
+
+  ZhihuPublisher._insert_content:
+    signature: "def _insert_content(self, page, html: str, plain: str) -> bool"
+    module: publisher.py
+    reusable: partial
+    coupling: framework
+    side_effect: [clipboard write, keyboard input]
+    description: >
+      3-tier fallback into Draft.js contenteditable:
+      (1) navigator.clipboard.write text/html + text/plain, then Ctrl+V (real paste);
+      (2) dispatch synthetic ClipboardEvent('paste') with a DataTransfer;
+      (3) plain-text keyboard.type.
+      Each tier verified by comparing innerText length to the markdown's plain length.
+    extract_note: >
+      "rich text into Draft.js / contenteditable" pattern reusable; clipboard tier
+      requires granting clipboard-read + clipboard-write permissions first.
+
+  ZhihuPublisher._md_to_html:
+    signature: "def _md_to_html(md: str) -> str  (+ _md_to_plain, _inline)"
+    module: publisher.py
+    reusable: yes
+    coupling: none
+    side_effect: [pure function]
+    description: >
+      Minimal dependency-free markdown subset -> HTML: headings, paragraphs,
+      ul/ol, hr, **bold**, *italic*, [text](url), bare URLs
+      (URL charset excludes Chinese punctuation).
+    extract_note: "generic markdown subset converter; zero deps; copy-paste directly"
+
+  ZhihuPublisher._insert_image:
+    signature: "def _insert_image(self, page, img_path: str) -> bool"
+    module: publisher.py
+    reusable: partial
+    coupling: framework
+    side_effect: [file chooser, keyboard input]
+    description: >
+      Move caret to editor end (Ctrl+End), then insert picture:
+      (1) set_input_files on a hidden input[type=file][accept*=image];
+      (2) fallback: click the toolbar 图片 button inside expect_file_chooser and
+      set_files. Success verified by counting <img> inside the editor.
+      Best-effort: a failure only logs and publishing continues text-only.
+    extract_note: 'upload image into a rich-text editor; selectors are zhihu-specific'
+
+  ZhihuPublisher._reference_screenshot:
+    signature: "def _reference_screenshot(self, page, url='https://www.sanfengyun.com') -> str"
+    module: publisher.py
+    reusable: partial
+    coupling: none
+    side_effect: [new page, screenshot file]
+    description: >
+      Open the referenced site in a sibling tab of the same context, screenshot it
+      (viewport, not full_page), close the tab, return the png path.
+    extract_note: 'capture a reference screenshot in a separate tab; reusable pattern'
+
+  ZhihuPublisher._compress_screenshot:
+    signature: "def _compress_screenshot(img_path: str, max_kb: int = 500)"
+    module: publisher.py
+    reusable: yes
+    coupling: none
+    side_effect: [file overwrite]
+    description: >
+      PNG -> RGB -> JPG, quality 85->55 decrement until <= max_kb.
+      If still over, resize width to 1024px. os.replace to overwrite original.
+      Swallow ImportError if Pillow missing.
+    extract_note: >
+      GENERIC image compression utility. Fully portable to any project needing
+      screenshot/image size reduction. Copy-paste directly.
+
+  ZhihuPublisher._detect_token:
+    signature: "def _detect_token(page) -> str"
+    module: publisher.py
+    reusable: partial
+    coupling: business_zhihu
+    side_effect: []
+    description: infer profile token from a /people/ avatar link; used as fallback for article-url lookup
+    extract_note: '"regex extract from links" pattern reusable'
+
+  # ---------------- qr_service.py (QR push to DingTalk) ----------------
+
+  QrServer.publish:
+    signature: "def publish(self, img_path: str) -> str"
+    module: qr_service.py
+    reusable: yes
+    coupling: none
+    side_effect: [bind port, http serve, file read]
+    description: >
+      Lazily starts a ThreadingHTTPServer bound to 0.0.0.0:<port> and exposes the image
+      at `/<random-token>.png` only; every other path returns 404. Each call re-tokenizes
+      the path and swaps the payload, so refreshing the QR invalidates old URLs.
+      close() shuts the server down (called in a finally block by the caller).
+    extract_note: >
+      "serve exactly one file from a temporary random path, then shut down" is a
+      reusable pattern for exposing a private artifact to an IM/webhook fetcher.
+    hard_constraint: serve ONLY the token path; never expose a directory listing
+
+  QrPusher.push:
+    signature: "def push(self, img_path: str) -> bool"
+    module: qr_service.py
+    reusable: partial
+    coupling: external
+    side_effect: [bind port, http post, file read]
+    description: >
+      Resolve a public URL for the QR — local QrServer first (base_url + token path,
+      port auto-appended when != 80), else upload to https://0x0.st — then call
+      notifier.notify_login_qr(url). Falls back to notify_login_qr_failed(path).
+    extract_note: "public-URL resolution with graceful degradation; reusable shape"
+
+  # ---------------- renewer.py (SanfengyunRenewer) ----------------
+
+  SanfengyunRenewer.fill_and_submit:
+    signature: "def fill_and_submit(self, page, ptype, article_url, screenshot_path, dry_run, page_url) -> dict"
+    module: renewer.py
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: [form fill, file upload, optional form submit, screenshot]
+    input: page, ptype, article_url, screenshot_path, dry_run(bool), page_url
+    output: "{success: bool, response_text: str, next_renew_time: str}"
+    description: >
+      Goto product page, wait for form, scroll bottom, fill url, upload screenshot,
+      if dry_run skip submit. If submit, read result text.
+    hard_constraint:
+      - upload only ONE file path string, NEVER a list
+    extract_note: sanfengyun form selectors hard-coded; not portable
+
+  SanfengyunRenewer._click_renew_tab:
+    signature: "def _click_renew_tab(self, page) -> bool"
+    module: renewer.py
+    reusable: partial
+    coupling: framework
+    side_effect: [page interaction]
+    description: SAME as scanner._click_renew_tab (code duplication)
+    anti_pattern: code duplication with scanner._click_renew_tab; refactor to shared util
+    extract_note: reusable pattern (see scanner version)
+
+  SanfengyunRenewer._fill_url:
+    signature: "def _fill_url(self, page, article_url: str)"
+    module: renewer.py
+    reusable: partial
+    coupling: framework
+    side_effect: [form fill]
+    description: >
+      Multi-selector fallback: input[placeholder*="发帖网址"] → "发帖地址" → "发帖" → "网址".
+      JS fallback: find label "发帖地址", get adjacent input, set value + dispatch input event.
+    extract_note: '"multi-selector fallback fill" pattern reusable'
+
+  SanfengyunRenewer._upload_screenshot:
+    signature: "def _upload_screenshot(self, page, screenshot_path: str)"
+    module: renewer.py
+    reusable: partial
+    coupling: framework
+    side_effect: [file upload]
+    description: set_input_files(screenshot_path) on input#fileImg1 or input[type=file]
+    hard_constraint: pass single path string, NOT a list
+    extract_note: generic file upload pattern; selector may change
+
+  SanfengyunRenewer._submit:
+    signature: "def _submit(self, page, ptype: str) -> dict"
+    module: renewer.py
+    reusable: no
+    coupling: business_sanfengyun
+    side_effect: [form submit, network]
+    description: >
+      Click submit, read response text. success if contains "提交成功/已提交/审核中/等待审核".
+      failed if contains "失败/未通过/错误/Error/请先".
+      success = success_flag or not failed_flag (no keyword = assume success).
+      Extract next_renew_time via regex.
+    extract_note: not portable
+
+  # ---------------- article_generator.py (ArticleGenerator) ----------------
+
+  ArticleGenerator.generate:
+    signature: "def generate(self, product_name: str = '') -> tuple[str, str]"
+    module: article_generator.py
+    reusable: partial
+    coupling: none
+    side_effect: []
+    output: (title, content)
+    description: >
+      Random article generation from 10 template pools (title/intro/about/config/
+      experience/usage/compare/pros/cons/tips/conclusion). Each pool random-pick 1,
+      concatenate. Timestamp placeholders {NOW_FULL}/{NOW_DATE} injected.
+      Title gets date + product_type + 6-char md5(time+random) suffix for uniqueness.
+      Content is written as "三丰云 introduction + cross-vendor comparison" (aliyun /
+      tencent / huawei / jdcloud / ucloud / rainyun) so platforms do not flag it as an ad.
+    submission_rules:
+      - no "申请延期"/"延期"/"续期" wording anywhere (FORBIDDEN_WORDS)
+      - MUST contain "三丰云", "免费云服务器", "免费虚拟主机" (REQUIRED_KEYWORDS)
+      - MUST contain https://www.sanfengyun.com
+      - review body longer than 50 chars (actual ~1500+)
+    extract_note: >
+      "template-pool random generation + timestamp injection + hash suffix" pattern
+      is reusable for any anti-duplicate article generation. Templates need rewriting
+      for other topics; check() encodes the site's submission rules.
+
+  ArticleGenerator.check:
+    signature: "def check(cls, title: str, content: str) -> list"
+    module: article_generator.py
+    reusable: yes
+    coupling: none
+    side_effect: []
+    description: >
+      Validate generated article against submission rules: required keywords,
+      forbidden words (延期/续期/发帖/白嫖...), official URL, minimum length.
+      Returns [] when compliant; generate() logs a warning when not.
+    extract_note: "keyword/blacklist content gate; reusable as a pre-publish sanity check"
+
+  ArticleGenerator.generate_simple:
+    signature: "def generate_simple(self) -> tuple[str, str]"
+    module: article_generator.py
+    reusable: partial
+    coupling: none
+    side_effect: []
+    description: single fixed template + current date (fallback/backup generator)
+    extract_note: simple template pattern reusable
+
+  # ---------------- dingtalk_notify.py (DingTalkNotifier) ----------------
+
+  DingTalkNotifier._sign:
+    signature: "def _sign(self) -> dict"
+    module: dingtalk_notify.py
+    reusable: yes
+    coupling: external
+    side_effect: []
+    output: "{timestamp: str, sign: str}"
+    description: >
+      DingTalk HMAC-SHA256 sign: timestamp_ms, string_to_sign = f"{ts}\n{secret}",
+      sign = base64(hmac_sha256(secret, string_to_sign)).
+    extract_note: >
+      GENERIC DingTalk robot sign utility. Copy-paste directly to any project
+      using DingTalk custom robot with sign security.
+
+  DingTalkNotifier._get_url:
+    signature: "def _get_url(self) -> str"
+    module: dingtalk_notify.py
+    reusable: yes
+    coupling: external
+    side_effect: []
+    output: signed webhook url string
+    description: build webhook url with timestamp + sign params
+    extract_note: reusable with _sign
+
+  DingTalkNotifier.send_text:
+    signature: "def send_text(self, content: str) -> bool"
+    module: dingtalk_notify.py
+    reusable: yes
+    coupling: external
+    side_effect: [http post]
+    description: send plain text message
+    extract_note: generic dingtalk text sender
+
+  DingTalkNotifier.send_markdown:
+    signature: "def send_markdown(self, title: str, text: str) -> bool"
+    module: dingtalk_notify.py
+    reusable: yes
+    coupling: external
+    side_effect: [http post]
+    description: send markdown message
+    extract_note: generic dingtalk markdown sender
+
+  DingTalkNotifier._send:
+    signature: "def _send(self, data: dict) -> bool"
+    module: dingtalk_notify.py
+    reusable: yes
+    coupling: external
+    side_effect: [http post]
+    hard_constraint: must catch all exceptions; notification failure must NOT crash main
+    description: post json to signed webhook, 10s timeout, swallow exceptions
+    extract_note: generic webhook post wrapper; reusable for any HTTP notification
+
+  DingTalkNotifier.notify_scan:
+    signature: "def notify_scan(self, products: list)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: format scan results with status icons (🟢not_yet 🔴ready/in_review ⚫not_activated)
+    extract_note: status-icon mapping pattern reusable; content is project-specific
+
+  DingTalkNotifier.notify_login_qr:
+    signature: "def notify_login_qr(self, image_url: str)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: >
+      Markdown message with an inline image `![知乎登录二维码](image_url)` plus a plain
+      link fallback (in case the client cannot render the image). Used when the zhihu
+      cookie expired and the human must scan.
+    extract_note: >
+      "IM message with inline image + plain-link fallback" is a reusable delivery
+      pattern for any webhook that only accepts public http(s) image URLs.
+    hard_constraint: image_url MUST be publicly reachable (custom robots cannot upload files)
+
+  DingTalkNotifier.notify_login_qr_failed:
+    signature: "def notify_login_qr_failed(self, local_path: str)"
+    module: dingtalk_notify.py
+    reusable: no
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: fallback message carrying the server-side QR path when no public URL can be produced
+
+  DingTalkNotifier.notify_login_success:
+    signature: "def notify_login_success(self)"
+    module: dingtalk_notify.py
+    reusable: no
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: confirmation after a successful QR scan
+
+  DingTalkNotifier.persona:
+    signature: "class-level style (no code)"
+    module: dingtalk_notify.py
+    reusable: no
+    coupling: business_dingtalk
+    description: >
+      All messages speak as a catgirl ("人家" / "主人" / "喵～"). Technical payload
+      (timestamps, status, URLs, tracebacks) is preserved verbatim inside backticks —
+      only the surrounding prose is styled.
+    extract_note: >
+      persona belongs to the copy layer only; never let it swallow diagnostic data,
+      or the operator loses the information needed to fix a failure.
+
+  DingTalkNotifier.notify_countdown_urgent:
+    signature: "def notify_countdown_urgent(self, product_name, next_time, remain_str)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: urgent notify when trigger within 30min (URGENT_HINT_THRESHOLD=1800)
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_trigger_fired:
+    signature: "def notify_trigger_fired(self, product_name, next_time)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_article_posted:
+    signature: "def notify_article_posted(self, product_name, article_url, title)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_submit_success:
+    signature: "def notify_submit_success(self, product_name, article_url, response, next_time, next_run_ts)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    description: notify submit success with NEXT run time (core info for user)
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_submit_failed:
+    signature: "def notify_submit_failed(self, product_name, error, next_run_ts)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_waiting:
+    signature: "def notify_waiting(self, product_name, reason, next_run_ts)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    extract_note: pattern reusable
+
+  DingTalkNotifier.notify_error:
+    signature: "def notify_error(self, error: str)"
+    module: dingtalk_notify.py
+    reusable: partial
+    coupling: business_dingtalk
+    side_effect: [http post]
+    extract_note: pattern reusable
+
+# =============================================================================
+# DATA SCHEMAS
+# =============================================================================
+
+data_schema:
+
+  scan_product_result:
+    name: str                 # product display name
+    ptype: str                # "vps" | "vhost"
+    page_url: str             # product detail page url
+    instance_id: str          # from url regex
+    instance_type: str        # "freeServer" | "freeVhost"
+    expire_time: str          # "YYYY-MM-DD HH:MM:SS" or ""
+    can_renew: bool           # legacy field, based on button + "未到时间" text
+    renew_time: str           # "请在 XX 后提交" parsed time, or ""
+    form_status: str          # CORE: "ready" | "in_review" | "not_yet" | "not_activated"
+
+  fill_and_submit_result:
+    success: bool
+    response_text: str        # first 800 chars of post-submit page text
+    next_renew_time: str      # parsed "请在 XX 后提交" or ""
+
+  config_yaml_schema:
+    sanfengyun:
+      phone: str
+      password: str
+    zhihu:
+      email: str                  # zhihu login phone or email
+      password: str
+      username: str               # optional profile token: zhihu.com/people/<token>
+      cookies_file: str           # optional; default zhihu_cookies.json (auto-saved)
+    dingtalk:
+      enabled: bool               # false = skip all notifications
+      webhook: str
+      secret: str
+      at_all: bool
+      at_mobiles: list
+    settings:
+      dry_run: bool               # true = fill form but NO submit (test mode)
+      scan_scope: str             # "all" | "vps" | "vhost"
+      sanitize_keywords:
+        - str                     # OPTIONAL list[str]: [from_word, to_word]. DEFAULT [] = no
+                                  # replacement, because the site's submission rule REQUIRES
+                                  # the literal word "三丰云" to appear in the article.
+      qr_public_base: str         # OPTIONAL e.g. "http://43.226.36.154"; public prefix used
+                                  # for the temporary QR image server (must be reachable by
+                                  # DingTalk). "" -> fall back to the 0x0.st image host.
+      qr_port: int                # temporary QR http server port, default 80
+      check_interval: int         # LEGACY: present in config but NOT used by code
+      early_submit_seconds: int   # LEGACY: present in config but NOT used by code
+    products:
+      - key: str
+        name: str
+        ptype: str                # "vps" | "vhost"
+        url: str
+        enabled: bool
+    logging:
+      level: str                  # "INFO" | "DEBUG" | "WARNING"
+      file: str                   # log file path; "" = stdout only
+
+# =============================================================================
+# STATE MACHINE (form_status based)
+# =============================================================================
+
+state_machine:
+  states: [ready, in_review, not_yet, not_activated]
+  trigger: every SLEEP_SLICE=60s, check now >= next_allow_submit_ts + TRIGGER_DELAY
+  global_data_priority: DOM_page_data > local_json_persistence
+  transition_table:
+
+    ready:
+      condition: "DOM shows submit form (post url input exists)"
+      action: >
+        1. publish article on zhihu -> get article_url + screenshot
+        2. fill sanfengyun form with article_url + screenshot
+        3. submit form (unless dry_run)
+      on_submit_success:
+        next_allow_submit_ts: "now + 14400 (4h cooldown for audit)"
+        return_value: "ok"
+      on_submit_fail:
+        next_allow_submit_ts: "now + 1800 (30min retry)"
+        return_value: "fail"
+      on_publish_fail:
+        next_allow_submit_ts: "unchanged (retry next tick)"
+        return_value: "fail"
+
+    in_review:
+      condition: 'DOM shows "审核中" / "审核" / "等待" keywords'
+      action: "skip article publish and form submit; re-scan after 2h until form_status changes"
+      next_allow_submit_ts: "now + 7200 (2h, wait audit result, loop scan)"
+      return_value: "skip"
+      hard_constraint: "MUST NOT publish article in this state"
+
+    not_activated:
+      condition: "DOM matches 13 not-activated keywords"
+      action: "skip everything"
+      next_allow_submit_ts: "now + 86400 (24h, re-check tomorrow)"
+      return_value: "skip"
+
+    not_yet:
+      condition: 'DOM shows "未到时间" / "请在 XX 后" text'
+      action: "skip everything"
+      next_allow_submit_ts: "renew_time_ts + TRIGGER_DELAY if parsed; else now + 1800 (30min fallback)"
+      return_value: "skip"
+
+# =============================================================================
+# HARD CONSTRAINTS — MUST NOT VIOLATE
+# =============================================================================
+
+hard_constraint_list:
+  - id: HC01
+    rule: MUST NOT use multi-thread/threadpool for scheduling; only single-thread slice-sleep loop
+    reason: playwright sync api is not thread-safe; simple loop is sufficient
+
+  - id: HC02
+    rule: "IF form_status == in_review: NEVER invoke article publish"
+    reason: prevent duplicate articles while platform is auditing
+
+  - id: HC03
+    rule: "After form submit success: wait full 4h (cooldown) before DOM refresh"
+    reason: audit result does not appear instantly; immediate re-scan wastes resources
+
+  - id: HC04
+    rule: Upload form accepts ONLY single image file; pass string path, NOT list
+    reason: sanfengyun form rejects multiple files
+
+  - id: HC05
+    rule: DOM parsed data has higher priority than local json; json is ONLY for scheduling
+    reason: platform state can change independently; json is just a countdown cache
+
+  - id: HC06
+    rule: All notification calls must catch exceptions; notification failure cannot crash main
+    reason: user must not lose service automation just because dingtalk is down
+
+  - id: HC07
+    rule: Must capture KeyboardInterrupt for clean exit (close browser, save state)
+    reason: avoid orphan chromium processes and state loss
+
+  - id: HC08
+    rule: Use playwright sync api only; do NOT refactor to async-playwright
+    reason: sync is simpler and sufficient for single-process loop
+
+  - id: HC09
+    rule: DOM scan must extract expire_time BEFORE clicking renew tab
+    reason: tab switch may hide the header area containing expire_time
+
+  - id: HC10
+    rule: Cookie domain fix must set secure=False
+    reason: some sanfengyun endpoints use http; secure=True drops cookie on http
+
+  - id: HC11
+    rule: Vue SPA pages need networkidle + 5s extra wait before reading DOM
+    reason: Vue async render; networkidle alone is too early
+
+  - id: HC12
+    rule: zhihu article screenshot MUST be public article page with full_page=True
+    reason: sanfengyun audit requires visible public article, not admin edit page
+
+# =============================================================================
+# RISK ITEMS
+# =============================================================================
+
+risk_items:
+  - id: R01
+    risk: sanfengyun manual audit only during working hours; no audit at night/weekend/holiday
+    impact: instance may expire while waiting audit
+    mitigation: none currently (technical_debt TD01)
+
+  - id: R02
+    risk: After submit, "审核中" text does not appear instantly on page
+    impact: immediate re-scan may misclassify state
+    mitigation: 4h post-submit cooldown (HC03)
+
+  - id: R03
+    risk: instance_timestamps.json may get corrupted
+    impact: state loss on read → full re-scan on next startup
+    mitigation: read exception returns {} (full re-scan); write exception logged only
+
+  - id: R04
+    risk: playwright may leave orphan chromium processes after crash
+    impact: memory/resource leak
+    mitigation: KeyboardInterrupt handler closes browser; external `pkill -f chromium` as fallback
+
+  - id: R05
+    risk: sanfengyun DOM text/selectors may change after platform update
+    impact: scan_product returns wrong form_status
+    mitigation: screenshot saved for debugging; keyword lists need manual update
+
+  - id: R06
+    risk: zhihu may flag article as marketing/ad (e.g. "三丰云")
+    impact: publish blocked, or article limited/removed after audit
+    mitigation: sanitize_from/sanitize_to replacement in config
+
+  - id: R07
+    risk: zhihu slider captcha / risk-control may evolve beyond current simulation
+    impact: zhihu login fails
+    mitigation: _solve_slider retry 3 times, then 180s human QR-scan fallback; cookies persisted
+
+# =============================================================================
+# TECHNICAL DEBT
+# =============================================================================
+
+technical_debt:
+  - id: TD01
+    debt: no automatic holiday/working-hour detection
+    impact: may submit during non-audit hours, wasting 4h cooldown
+    suggestion: "add holiday calendar + only trigger during 9:00-18:00 workdays"
+
+  - id: TD02
+    debt: no log rotation
+    impact: run.log can grow indefinitely
+    suggestion: use RotatingFileHandler or TimedRotatingFileHandler
+
+  - id: TD03
+    debt: save_instance_state is NOT atomic (direct write, no tmp+rename)
+    impact: crash during write may corrupt json
+    suggestion: write to tmp file then os.replace
+
+  - id: TD04
+    debt: "code duplication: scanner._click_renew_tab and renewer._click_renew_tab are identical"
+    impact: maintenance burden
+    suggestion: extract to shared utility module
+
+  - id: TD05
+    debt: no circuit-breaker for repeated network failure
+    impact: may hammer server during outage
+    suggestion: add failure counter + backoff
+
+  - id: TD06
+    debt: no retry for playwright page.goto timeout
+    impact: single network hiccup fails entire product scan
+    suggestion: add 2-3 retries with backoff
+
+  - id: TD07
+    debt: _extract_expire_time and expire parsing logic duplicated in multiple places
+    impact: inconsistency risk
+    suggestion: centralize datetime parsing
+
+# =============================================================================
+# REUSABLE COMPONENT EXTRACTION MAP
+# =============================================================================
+
+reusable_template_extract_map:
+
+  can_copy_directly:
+    - load_instance_state          # generic json state loader
+    - save_instance_state          # generic json saver (add atomic write for prod)
+    - setup_logging                # generic logging config
+    - _human_countdown             # seconds → "Xd Xh Xm" formatter
+    - ZhihuPublisher._compress_screenshot    # generic image compression
+    - ZhihuPublisher._drag                   # generic human-like mouse drag
+    - ZhihuPublisher._md_to_html             # generic markdown subset converter
+    - DingTalkNotifier._sign       # DingTalk HMAC sign
+    - DingTalkNotifier._get_url    # signed webhook url builder
+    - DingTalkNotifier.send_text   # DingTalk text sender
+    - DingTalkNotifier.send_markdown  # DingTalk markdown sender
+    - DingTalkNotifier._send       # generic webhook post wrapper
+    - ArticleGenerator.generate    # template-pool random article generator (rewrite templates)
+
+  need_minor_adaptation:
+    - new_page                     # stealth page creation; reuse as-is
+    - launch_browser               # chromium path list needs OS adaptation
+    - find_chromium                # binary paths are linux-specific
+    - load_config                  # change config file path/name
+    - _calc_wait_seconds           # generic min-wait; adapt status dict shape
+    - _wait_until                  # generic sleep-until; reuse as-is
+    - _instance_key                # regex pattern reusable; change regex for other URLs
+    - SanfengyunScanner._fix_cookie_domain   # cross-subdomain cookie fix; change domain
+    - SanfengyunScanner._click_renew_tab      # fuzzy tab click by text; change text target
+    - SanfengyunScanner._extract_expire_time  # regex; change date format/keyword
+    - SanfengyunScanner.ensure_login           # force-relogin pattern; change selectors
+    - ZhihuPublisher._solve_slider             # human slider drag; HIGHLY reusable
+    - ZhihuPublisher._insert_content           # rich text into contenteditable editor
+    - ZhihuPublisher._insert_image             # image upload into rich-text editor
+    - ZhihuPublisher._reference_screenshot     # side-tab screenshot capture
+    - ArticleGenerator.check                   # keyword/blacklist content gate
+    - ZhihuPublisher._detect_token             # regex from links; change pattern
+    - ZhihuPublisher.login                     # cookie-first login cascade; change selectors
+    - ZhihuPublisher.publish                   # publish+screenshot pattern; change selectors
+    - SanfengyunRenewer._click_renew_tab       # same as scanner version
+    - SanfengyunRenewer._fill_url              # multi-selector fallback; change selectors
+    - SanfengyunRenewer._upload_screenshot     # file upload; change selector
+    - run_loop                                 # slice-sleep loop skeleton; rewrite business branches
+    - DingTalkNotifier.notify_*                # notification formatters; change content
+    - SanfengyunScanner.scan_all               # batch scan pattern; rewrite scan logic
+
+  business_locked_cannot_extract:
+    - SanfengyunScanner._do_login              # sanfengyun login selectors
+    - SanfengyunScanner._verify_api_login      # sanfengyun api endpoints
+    - SanfengyunScanner.scan_product           # sanfengyun DOM text patterns
+    - SanfengyunRenewer.fill_and_submit        # sanfengyun form selectors
+    - SanfengyunRenewer._submit                # sanfengyun submit result keywords
+    - _execute_single_product                  # full business workflow
+    - run_test                                 # business flow
+    - run_once                                 # business flow
+    - main                                     # CLI entry
+    - _next_ts_from_status                     # project cooldown mapping
+    - _notify_scan_result                      # project-specific formatting
+
+# =============================================================================
+# PORTING HINTS
+# =============================================================================
+
+porting_hint:
+  scenario_adapt_other_auto_renew_bot:
+    description: "adapt this project to another web-auto-renew/auto-sign bot"
+    steps:
+      - "reuse infra: load_instance_state, save_instance_state, setup_logging, _human_countdown"
+      - "reuse loop skeleton: run_loop slice-sleep + per-instance countdown"
+      - "reuse notification: DingTalkNotifier (or adapt _send to other IM webhook)"
+      - "reuse stealth page: new_page"
+      - "REWRITE: DOM scanner (scan_product) for target platform"
+      - "REWRITE: form submit (fill_and_submit) for target platform"
+      - "REWRITE: article/content generator if needed"
+      - "REWRITE: state machine business branches in _execute_single_product"
+
+  scenario_extract_generic_automation_utils:
+    description: "extract reusable utilities to a common lib"
+    extract:
+      - "_compress_screenshot (image compression)"
+      - "_sign + _get_url + send_text + send_markdown + _send (dingtalk notification)"
+      - "_handle_checkbox (captcha bypass)"
+      - "_fix_cookie_domain (cross-subdomain cookie)"
+      - "_click_renew_tab (fuzzy text click)"
+      - _fill_url (multi-selector fallback)
+      - load_instance_state + save_instance_state (json persistence)
+
+# =============================================================================
+# LLM MODIFY GUIDANCE
+# =============================================================================
+
+llm_modify_guidance:
+  - "When adding feature: preserve existing state-machine transitions; add new sub-branch instead of rewriting main flow."
+  - "When fixing bug: cross-check against hard_constraint_list and state_machine."
+  - "When extracting components: refer reusable_template_extract_map."
+  - "After code change: update AI_SPEC.yaml accordingly (function_catalog, state_machine, hard_constraint_list, risk_items, technical_debt)."
+  - "Output diff-style changes; full rewrite only when explicitly requested."
+  - "If introducing new external dependency: add to meta.major_deps."
+  - "If changing cooldown values: update both global_constants.cooldown_seconds AND state_machine transition_table AND _execute_single_product code."

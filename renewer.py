@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+模块3: renewer - 三丰云填写延期表单并提交
+从截图看 vps 详情页的延期表单结构:
+  发帖地址: [input placeholder="请输入发帖网址http://"]
+  发帖截图: [input type="file" id="fileImg1" name="CertImg"]  [选择文件]
+  [提交]  [确定]
+"""
+
+import re
+import logging
+from pathlib import Path
+
+logger = logging.getLogger("sanfengyun.renewer")
+
+SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
+SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+
+class SanfengyunRenewer:
+    """三丰云延期填表器"""
+
+    def fill_and_submit(self, page, ptype: str, article_url: str,
+                        screenshot_path: str, dry_run: bool = False,
+                        page_url: str = "") -> dict:
+        """
+        进入产品详情页 → 滚动到发帖表单 → 填URL → 上传截图 → (可选)提交
+        """
+        action = "（仅填写，不提交）" if dry_run else ""
+        logger.info(f"[延期] {ptype} {action}")
+
+        # 1) 跳转到产品详情页
+        if page_url:
+            page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+
+        # 2) 等待 + 点击"免费延期" tab
+        form_found = False
+        for i in range(30):
+            page.wait_for_timeout(1000)
+            body = page.inner_text("body")
+            if "发帖地址" in body and "发帖截图" in body:
+                logger.info(f"[延期] 发帖表单已加载（第{i+1}秒）")
+                form_found = True
+                break
+            if "还未到" in body or "未到需要" in body:
+                logger.info(f"[延期] 未到延期时间（第{i+1}秒），有提示")
+                # 点免费延期 tab 确认一下（tab 里才会显示完整提示）
+                self._click_renew_tab(page)
+                page.wait_for_timeout(2000)
+                body = page.inner_text("body")
+                if "还未到" in body or "未到需要" in body:
+                    logger.warning("[延期] 🟢 确认未到延期时间，跳过")
+                    return {"success": False, "response_text": "未到延期时间", "next_renew_time": ""}
+                # 提示消失后继续下一轮，等表单出现
+                continue
+            # 点击 免费延期 tab
+            self._click_renew_tab(page)
+            page.wait_for_timeout(1500)
+            if i % 5 == 0 and i > 0:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0);")
+
+        if not form_found:
+            logger.error("[延期] ❌ 30秒内未找到发帖表单，终止")
+            return {"success": False, "response_text": "未找到发帖表单", "next_renew_time": ""}
+
+        # 3) 滚动到表单 + 截图
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1000)
+        page.screenshot(path=str(SCREENSHOT_DIR / f"sf_{ptype}_form.png"))
+
+        # 4) 填发帖 URL
+        if not self._fill_url(page, article_url):
+            logger.error("[延期] ❌ 填写发帖地址失败，终止")
+            return {"success": False, "response_text": "填写发帖地址失败", "next_renew_time": ""}
+
+        # 5) 上传截图
+        if not self._upload_screenshot(page, screenshot_path):
+            logger.error("[延期] ❌ 上传发帖截图失败，终止")
+            return {"success": False, "response_text": "上传发帖截图失败", "next_renew_time": ""}
+
+        # 截图已填好的表单
+        page.screenshot(path=str(SCREENSHOT_DIR / f"sf_{ptype}_filled.png"), full_page=True)
+        logger.info("[延期] ✅ 表单已填写")
+
+        if dry_run:
+            logger.info("[延期] 测试模式，跳过提交")
+            return {"success": True, "response_text": "dry_run", "next_renew_time": ""}
+
+        # 6) 点击提交
+        return self._submit(page, ptype)
+
+    # ---- 内部 ----
+
+    def _click_renew_tab(self, page):
+        """点击 免费延期 tab"""
+        try:
+            result = page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll('.el-tabs__item, [role="tab"], button, span, div');
+                    for (const el of items) {
+                        const t = (el.innerText || '').trim();
+                        if (t === '免费延期' || t === '延期') {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.width < 200 && r.height > 0) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            return bool(result)
+        except Exception:
+            return False
+
+    def _fill_url(self, page, article_url: str) -> bool:
+        """填发帖地址。从截图看 placeholder="请输入发帖网址http://" """
+        # 优先用 placeholder 精确匹配
+        selectors = [
+            'input[placeholder*="发帖网址"]',
+            'input[placeholder*="发帖地址"]',
+            'input[placeholder*="发帖"]',
+            'input[placeholder*="网址"]',
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.count() > 0 and el.is_visible():
+                    el.click()
+                    page.keyboard.press("Control+A")
+                    page.keyboard.type(article_url, delay=10)
+                    logger.info(f"[延期] ✅ 已填 URL: {article_url}")
+                    return True
+            except Exception:
+                continue
+
+        # 兜底: 找 "发帖地址" label 右边的 input
+        try:
+            url_input = page.evaluate("""
+                () => {
+                    const labels = document.querySelectorAll('label, span, div');
+                    for (const lb of labels) {
+                        if ((lb.innerText || '').trim() === '发帖地址') {
+                            const row = lb.closest('.el-form-item, .el-row, .form-item, div') || lb.parentElement;
+                            const input = row ? row.querySelector('input[type="text"]') : null;
+                            return input ? input : null;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if url_input:
+                page.evaluate("(el, url) => { el.value = url; el.dispatchEvent(new Event('input')); }", url_input, article_url)
+                logger.info(f"[延期] ✅ 已填 URL (JS方式): {article_url}")
+                return True
+        except Exception as e:
+            logger.error(f"[延期] 填 URL 失败: {e}")
+
+        logger.error("[延期] 未找到发帖地址输入框")
+        return False
+
+    def _upload_screenshot(self, page, screenshot_path: str) -> bool:
+        """上传发帖截图。从截图看 input[type=file] id="fileImg1" """
+        if not Path(screenshot_path).exists():
+            logger.error(f"[延期] 截图文件不存在: {screenshot_path}")
+            return False
+        try:
+            # 优先精确匹配
+            file_input = page.locator('input#fileImg1, input[type="file"]').first
+            if file_input.count() > 0:
+                file_input.set_input_files(screenshot_path)
+                logger.info("[延期] ✅ 已上传截图")
+                page.wait_for_timeout(3000)
+                return True
+            logger.error("[延期] 未找到文件上传 input")
+        except Exception as e:
+            logger.error(f"[延期] 上传截图失败: {e}")
+        return False
+
+    def _submit(self, page, ptype: str) -> dict:
+        """点击提交按钮，读取结果"""
+        logger.info("[延期] 点击提交...")
+        try:
+            submit = page.locator("button:has-text('提交')").first
+            if submit.count() == 0 or not submit.is_visible():
+                logger.error("[延期] 没找到提交按钮")
+                return {"success": False, "response_text": "没找到提交按钮", "next_renew_time": ""}
+
+            submit.click()
+            page.wait_for_timeout(3000)
+
+            # 处理可能的“确定/确认”弹窗
+            # 【修改重点】不要先点确定，先等弹窗出现并抓取文字
+            try:
+                # 等待弹窗出现（Element UI 的弹窗通常带有这个 class）
+                page.wait_for_selector(".el-message-box, .el-message", timeout=5000)
+                # 只抓取弹窗里的文字，不要抓全网页 body
+                resp = page.locator(".el-message-box__message, .el-message__content").first.inner_text()
+                logger.info(f"[延期] 捕获到弹窗提示: {resp}")
+            except Exception as e:
+                # 如果没抓到特定弹窗，兜底抓取全页
+                logger.warning(f"[延期] 未捕获到标准弹窗，抓取全页文本")
+                resp = page.inner_text("body")
+
+            # 截图保存证据（此时弹窗还在）
+            page.screenshot(path=str(SCREENSHOT_DIR / f"sf_{ptype}_submitted.png"))
+
+            # 基于抓取到的文字判断成功/失败（只认精确提示）
+            success = any(k in resp for k in ["提交成功", "已提交成功", "延期成功", "申请已提交"])
+            failed = any(k in resp for k in ["失败", "未通过", "错误", "Error", "请先"])
+
+            # 【修改重点】判断完毕后再去点“确定”关闭弹窗
+            try:
+                confirm = page.locator("button:has-text('确定'), button:has-text('确认')").first
+                if confirm.count() > 0 and confirm.is_visible():
+                    confirm.click()
+                    logger.info("[延期] 已点击确认按钮关闭弹窗")
+                    page.wait_for_timeout(1000) # 稍微等弹窗消失
+            except Exception:
+                pass
+
+            next_time = ""
+            m = re.search(r"请在(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{1,2}:\d{1,2})后", resp)
+            if m:
+                next_time = m.group(1).replace("/", "-")
+
+            if success and not failed:
+                logger.info("[延期] ✅ 提交成功")
+                ok = True
+            elif failed:
+                logger.error("[延期] ❌ 提交失败")
+                ok = False
+            else:
+                logger.warning("[延期] ⚠️ 未捕获到明确成功/失败提示，结果待人工确认")
+                ok = False
+
+            return {"success": ok, "response_text": resp[:800], "next_renew_time": next_time}
+            
+        except Exception as e:
+            logger.error(f"[延期] 提交异常: {e}")
+            return {"success": False, "response_text": str(e), "next_renew_time": ""}

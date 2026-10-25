@@ -1,0 +1,22 @@
+# ==========================================================================
+# 续命喵 - Python 依赖
+# 安装：pip install -r requirements.txt
+# 安装后还需执行：playwright install chromium
+#               playwright install-deps chromium  （服务器必装系统库）
+# ==========================================================================
+
+# 浏览器自动化引擎（核心，驱动 chromium 操作三丰云/知乎）
+playwright>=1.40.0
+
+# 隐藏 Playwright 自动化特征（防止网站检测 webdriver 标志）
+playwright-stealth>=2.0.0
+
+# YAML 配置文件解析（读取 config.yaml）
+PyYAML>=6.0
+
+# HTTP 请求（钉钉机器人 webhook 通知）
+requests>=2.28.0
+
+# 截图压缩（把知乎文章长截图压到 500KB 以内，三丰云审核偏好小图）
+# 可选：没装时脚本会跳过压缩，只是截图可能超 500KB
+Pillow>=9.0.0
