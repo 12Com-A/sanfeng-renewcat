@@ -13,7 +13,7 @@
 </p>
 
 ```bash
-git clone https://github.com/<你的用户名>/sanfeng-renewcat.git
+git clone https://github.com/12Com-A/sanfeng-renewcat.git
 cd sanfeng-renewcat && bash install.sh --login
 ```
 
@@ -174,7 +174,7 @@ sanfeng-renewcat/
 ### 第 1 步：克隆 & 安装依赖
 
 ```bash
-git clone https://github.com/你的用户名/sanfeng-renewcat.git
+git clone https://github.com/12Com-A/sanfeng-renewcat.git
 cd sanfeng-renewcat
 
 # 装 Python 依赖
@@ -310,7 +310,7 @@ python3 renewcat.py
 
 ```bash
 # 在服务器上（root）
-git clone <你的仓库> && cd sanfeng-renewcat
+git clone https://github.com/12Com-A/sanfeng-renewcat.git && cd sanfeng-renewcat
 bash install.sh                    # 交互式：会问你账号/钉钉/产品 URL
 ```
 
@@ -370,7 +370,7 @@ sudo chown -R $USER:$USER /root/sanfeng-renewcat
 
 # 方式 A：git clone
 cd /root/sanfeng-renewcat
-git clone https://github.com/你的用户名/sanfeng-renewcat.git .
+git clone https://github.com/12Com-A/sanfeng-renewcat.git .
 
 # 方式 B：本机打包 scp 过去
 # 在本机：tar czf sanfengyun.tar.gz sanfeng-renewcat/
