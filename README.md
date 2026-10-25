@@ -724,6 +724,7 @@ products:
 ## 许可
 
 [MIT](LICENSE) © 2026 Commkom
+
 部分代码来源：https://github.com/dyshk/sanfengyun-auto-renewal/ 此项目
 
 > 仅供学习交流。用自动化脚本操作第三方平台前，请自行确认是否符合该平台的服务条款；账号风险自负。
