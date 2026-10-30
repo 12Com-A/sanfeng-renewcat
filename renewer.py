@@ -179,65 +179,129 @@ class SanfengyunRenewer:
             logger.error(f"[延期] 上传截图失败: {e}")
         return False
 
+    # ---- 提交 ----
+
     def _submit(self, page, ptype: str) -> dict:
-        """点击提交按钮，读取结果"""
-        logger.info("[延期] 点击提交...")
-        try:
-            submit = page.locator("button:has-text('提交')").first
-            if submit.count() == 0 or not submit.is_visible():
-                logger.error("[延期] 没找到提交按钮")
-                return {"success": False, "response_text": "没找到提交按钮", "next_renew_time": ""}
+        """点提交 → 关弹窗 → 回「免费延期」页签看状态，判断是否已受理（审核中）
 
-            submit.click()
-            page.wait_for_timeout(3000)
-
-            # 处理可能的“确定/确认”弹窗
-            # 【修改重点】不要先点确定，先等弹窗出现并抓取文字
+        三丰云提交成功后往往不给"提交成功"弹窗，而是把页签内容换成
+        "审核中 / 已提交 / 未到延期时间"，所以不能再靠弹窗文字判定。
+        """
+        logger.info("[延期] 点击提交 / 延期申请...")
+        btn = None
+        for text in ("提交延期申请", "延期申请", "确认提交", "提交"):
             try:
-                # 等待弹窗出现（Element UI 的弹窗通常带有这个 class）
-                page.wait_for_selector(".el-message-box, .el-message", timeout=5000)
-                # 只抓取弹窗里的文字，不要抓全网页 body
-                resp = page.locator(".el-message-box__message, .el-message__content").first.inner_text()
-                logger.info(f"[延期] 捕获到弹窗提示: {resp}")
-            except Exception as e:
-                # 如果没抓到特定弹窗，兜底抓取全页
-                logger.warning(f"[延期] 未捕获到标准弹窗，抓取全页文本")
-                resp = page.inner_text("body")
-
-            # 截图保存证据（此时弹窗还在）
-            page.screenshot(path=str(SCREENSHOT_DIR / f"sf_{ptype}_submitted.png"))
-
-            # 基于抓取到的文字判断成功/失败（只认精确提示）
-            success = any(k in resp for k in ["提交成功", "已提交成功", "延期成功", "申请已提交"])
-            failed = any(k in resp for k in ["失败", "未通过", "错误", "Error", "请先"])
-
-            # 【修改重点】判断完毕后再去点“确定”关闭弹窗
-            try:
-                confirm = page.locator("button:has-text('确定'), button:has-text('确认')").first
-                if confirm.count() > 0 and confirm.is_visible():
-                    confirm.click()
-                    logger.info("[延期] 已点击确认按钮关闭弹窗")
-                    page.wait_for_timeout(1000) # 稍微等弹窗消失
+                loc = page.locator(f"button:has-text('{text}')").first
+                if loc.count() and loc.is_visible():
+                    btn = loc
+                    logger.info(f"[延期] 点击「{text}」")
+                    break
             except Exception:
-                pass
+                continue
 
-            next_time = ""
-            m = re.search(r"请在(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{1,2}:\d{1,2})后", resp)
-            if m:
-                next_time = m.group(1).replace("/", "-")
+        if btn is None:
+            logger.error("[延期] 没找到提交按钮")
+            return {"success": False, "response_text": "没找到提交按钮", "next_renew_time": ""}
 
-            if success and not failed:
-                logger.info("[延期] ✅ 提交成功")
-                ok = True
-            elif failed:
-                logger.error("[延期] ❌ 提交失败")
-                ok = False
-            else:
-                logger.warning("[延期] ⚠️ 未捕获到明确成功/失败提示，结果待人工确认")
-                ok = False
+        btn.click()
+        page.wait_for_timeout(2500)
 
-            return {"success": ok, "response_text": resp[:800], "next_renew_time": next_time}
-            
-        except Exception as e:
-            logger.error(f"[延期] 提交异常: {e}")
-            return {"success": False, "response_text": str(e), "next_renew_time": ""}
+        dialog = self._grab_dialog(page)     # 有弹窗就抓一下（可能根本没有）
+        self._confirm_dialog(page)           # 点「确定/确认」把弹窗关掉
+        page.wait_for_timeout(1500)
+
+        # 关键：重新读「免费延期」页签，看是不是变成审核中 / 表单收起
+        state = self._read_renew_state(page)
+        page.screenshot(path=str(SCREENSHOT_DIR / f"sf_{ptype}_submitted.png"))
+
+        body = state["body"]
+        merged = f"{dialog}\n{body}"
+        next_time = state["next_time"]
+
+        hard_fail = any(k in merged for k in ("请先", "不符合", "未通过", "提交失败", "操作失败"))
+        accepted = any(k in body for k in (
+            "审核中", "正在审核", "等待审核", "审核结果", "已提交", "提交成功", "申请成功", "审核通过"))
+        waiting = ("未到" in body) or ("还未到" in body)
+        form_gone = ("发帖地址" not in body) and ("发帖截图" not in body)
+
+        if hard_fail:
+            ok, note = False, "明确报错"
+        elif accepted:
+            ok, note = True, "审核中"
+        elif waiting or form_gone:
+            ok, note = True, "已受理（表单已收起 / 提示未到时间）"
+        else:
+            ok, note = False, "状态不明，稍后重试"
+
+        snippet = self._snippet(merged, ("审核", "未到", "成功", "失败", "请先", "提交"))
+        if ok:
+            logger.info(f"[延期] ✅ 提交已受理（{note}）| {snippet[:120]}")
+        else:
+            logger.error(f"[延期] ❌ 提交未被受理（{note}）| {snippet[:120]}")
+
+        return {"success": ok, "response_text": f"{note}｜{snippet}", "next_renew_time": next_time}
+
+    # ---- 提交相关小工具 ----
+
+    @staticmethod
+    def _grab_dialog(page) -> str:
+        """抓 Element UI 弹窗文字（没有就返回空）"""
+        try:
+            page.wait_for_selector(".el-message-box__message, .el-message__content", timeout=4000)
+            txt = page.locator(".el-message-box__message, .el-message__content").first.inner_text()
+            txt = (txt or "").strip()
+            if txt:
+                logger.info(f"[延期] 弹窗提示: {txt[:100]}")
+            return txt
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _confirm_dialog(page) -> bool:
+        """点掉「确定/确认」弹窗"""
+        for text in ("确定", "确认", "知道了"):
+            try:
+                btn = page.locator(f".el-message-box button:has-text('{text}')").first
+                if btn.count() and btn.is_visible():
+                    btn.click()
+                    logger.info(f"[延期] 弹窗点「{text}」关闭")
+                    page.wait_for_timeout(1200)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _read_renew_state(self, page) -> dict:
+        """提交后重新看一眼「免费延期」页签，拿到最新状态文字 + 下次可提交时间"""
+        body = ""
+        for attempt in (1, 2):
+            try:
+                if attempt == 2:
+                    logger.info("[延期] 状态没读懂，刷新页面再看一次")
+                    page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                self._click_renew_tab(page)
+                page.wait_for_timeout(2500)
+                body = page.inner_text("body") or ""
+            except Exception as e:
+                logger.warning(f"[延期] 读取状态失败(第{attempt}次): {e}")
+                body = ""
+            if any(k in body for k in ("审核", "未到", "发帖地址")):
+                break
+
+        next_time = ""
+        m = re.search(r"请在\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{1,2}:\d{1,2})", body)
+        if m:
+            next_time = m.group(1).replace("/", "-")
+        return {"body": body, "next_time": next_time}
+
+    @staticmethod
+    def _snippet(text: str, keywords, width: int = 160) -> str:
+        """从整页文字里截出和关键词相关的一小段，别把整个导航栏发到钉钉"""
+        flat = re.sub(r"\s+", " ", text or "").strip()
+        for kw in keywords:
+            idx = flat.find(kw)
+            if idx >= 0:
+                start = max(0, idx - 40)
+                return flat[start:start + width]
+        return flat[:width]
