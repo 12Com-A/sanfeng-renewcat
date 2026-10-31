@@ -19,7 +19,7 @@ import json
 import time
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -597,7 +597,9 @@ def run_loop(cfg: dict, notifier):
           - form_status=not_activated → now + 24h（产品未开通，一天后再查）
           - form_status=in_review      → now + 2h（审核中，2h 后再扫）
           - form_status=ready          → 当前时间（现在就可以触发）
-          - 其他                       → 解析 renew_time；解析不到兜底 now+30min
+          - 其他                       → 解析 renew_time；
+                                          解析不到就用「到期时间 - 3 天」推算（三丰云提前 3 天开放提交）；
+                                          再不行才兜底 now+30min
         """
         fs = status.get("form_status", "")
         if fs == "not_activated":
@@ -613,6 +615,21 @@ def run_loop(cfg: dict, notifier):
                 return int(dt.timestamp())
             except Exception:
                 pass
+
+        # 页面只给了"还未到时间"却没给具体时间：按到期时间倒推，别每 30 分钟白扫一次
+        expire_str = status.get("expire_time", "") or ""
+        if expire_str:
+            try:
+                exp = datetime.strptime(expire_str.replace("/", "-"), "%Y-%m-%d %H:%M:%S")
+                cand = int((exp - timedelta(days=3)).timestamp())
+                if cand > int(time.time()) + 600:
+                    logger.info(
+                        f"[状态] 没解析到可提交时间，按到期前 3 天推算: {datetime.fromtimestamp(cand)}"
+                    )
+                    return cand
+            except Exception:
+                pass
+
         return int(time.time()) + 1800  # 兜底 30 分钟后重试
 
     # =================================================================

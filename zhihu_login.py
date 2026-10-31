@@ -94,6 +94,9 @@ def main() -> int:
     print(f"知乎账号: {zh.get('email', '(未配置)')}")
     print(f"二维码推送: {'钉钉' if isinstance(sink, QrPusher) else '本地文件'}")
 
+    # QrPusher 用 push()，LocalSink 用 notify_login_qr()，这里统一成一个回调
+    on_qr = sink.push if isinstance(sink, QrPusher) else sink.notify_login_qr
+
     ok = False
     with sync_playwright() as pw:
         browser = launch_browser(pw, headless=False)
@@ -102,11 +105,11 @@ def main() -> int:
         try:
             if args.force:
                 ok = publisher.login_by_qr(
-                    page, on_qr=sink.notify_login_qr,
+                    page, on_qr=on_qr,
                     rounds=args.rounds, wait=args.wait,
                 )
             else:
-                ok = publisher.login(page, on_qr=sink.notify_login_qr)
+                ok = publisher.login(page, on_qr=on_qr)
         except Exception as e:
             print(f"登录过程出错: {e}", file=sys.stderr)
         finally:
@@ -118,7 +121,13 @@ def main() -> int:
                 pass
 
     if ok:
-        sink.notify_login_success()
+        if isinstance(sink, QrPusher):
+            try:
+                sink.notifier.notify_login_success()
+            except Exception:
+                pass
+        else:
+            sink.notify_login_success()
         print(f"cookie 已保存: {publisher.cookies_file}")
         return 0
 

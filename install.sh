@@ -147,12 +147,17 @@ if [ -n "$REPO_URL" ]; then
     fi
 elif [ -f "$SRC_DIR/renewcat.py" ]; then
     log "从本地目录安装: $SRC_DIR"
-    mkdir -p "$INSTALL_DIR"
-    # 只覆盖代码与文档，绝不动 config.yaml / cookies / 运行状态
-    for f in *.py README.md AI_SPEC.yaml requirements.txt install.sh config.example.yaml; do
-        [ -f "$SRC_DIR/$f" ] && cp -f "$SRC_DIR/$f" "$INSTALL_DIR/$f"
-    done
-    [ -d "$SRC_DIR/deploy" ] && cp -rf "$SRC_DIR/deploy" "$INSTALL_DIR/"
+    if [ -d "$INSTALL_DIR" ] && [ "$(cd "$SRC_DIR" && pwd -P)" = "$(cd "$INSTALL_DIR" && pwd -P)" ]; then
+        # 解压出来的目录正好就是安装目录：跳过拷贝，免得自己拷自己
+        dim "源码目录 = 安装目录（$INSTALL_DIR），跳过拷贝"
+    else
+        mkdir -p "$INSTALL_DIR"
+        # 只覆盖代码与文档，绝不动 config.yaml / cookies / 运行状态
+        for f in *.py README.md AI_SPEC.yaml requirements.txt install.sh config.example.yaml; do
+            [ -f "$SRC_DIR/$f" ] && cp -f "$SRC_DIR/$f" "$INSTALL_DIR/$f"
+        done
+        [ -d "$SRC_DIR/deploy" ] && cp -rf "$SRC_DIR/deploy" "$INSTALL_DIR/"
+    fi
 else
     die "找不到源码：$SRC_DIR 里没有 renewcat.py（用 --src 或 --repo 指定）"
 fi
@@ -338,18 +343,34 @@ fi
 # 7. systemd
 # ---------------------------------------------------------------------------
 if [ "$WITH_SERVICE" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
-    log "注册 systemd 服务 sanfengyun ..."
+    log "注册 systemd 服务 renewcat ..."
+    # Xvfb 单独一个服务：重启 renewcat 时显示不会跟着断
+    cat > /etc/systemd/system/xvfb.service <<'EOF'
+[Unit]
+Description=Virtual framebuffer X server for RenewCat (:99)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
     cat > /etc/systemd/system/renewcat.service <<EOF
 [Unit]
-Description=Sanfengyun auto renewal (zhihu publisher)
-After=network-online.target
-Wants=network-online.target
+Description=RenewCat - sanfengyun auto renewal (zhihu publisher)
+After=network-online.target xvfb.service
+Wants=network-online.target xvfb.service
 
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/renewcat.py
 Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:99
 KillSignal=SIGINT
 TimeoutStopSec=30
 Restart=on-failure
@@ -359,6 +380,8 @@ RestartSec=30
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
+    systemctl enable xvfb >/dev/null 2>&1
+    systemctl restart xvfb
     systemctl enable renewcat >/dev/null 2>&1
     if [ "$CONFIG_OK" -eq 1 ]; then
         systemctl restart renewcat
